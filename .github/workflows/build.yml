@@ -1,0 +1,61 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kaynak kodunu çek (Checkout)
+        uses: actions/checkout@v4
+
+      - name: JDK 17 Kurulumu
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: android.jar (API 34) Hazırla
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls -la "$ANDROID_HOME/platforms" || true
+          if [ ! -f "$ANDROID_HOME/platforms/android-34/android.jar" ]; then
+            SDKMGR=$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager | sort -r | head -n 1)
+            yes | "$SDKMGR" --licenses > /dev/null || true
+            "$SDKMGR" "platforms;android-34" "build-tools;34.0.0"
+          fi
+          mkdir -p app/src/main/assets
+          cp "$ANDROID_HOME/platforms/android-34/android.jar" app/src/main/assets/android.jar
+          ls -lh app/src/main/assets/android.jar
+
+      - name: ARM64 libaapt2.so Kontrolü ve Hazırlığı
+        run: |
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          if [ ! -f "app/src/main/jniLibs/arm64-v8a/libaapt2.so" ]; then
+            echo "libaapt2.so indiriliyor (ReVanced AOSP ARM64 aapt2)..."
+            curl -L --fail "https://github.com/ReVanced/aapt2/releases/download/v1.1.0/aapt2-arm64-v8a" \
+              -o app/src/main/jniLibs/arm64-v8a/libaapt2.so
+          fi
+          chmod +x app/src/main/jniLibs/arm64-v8a/libaapt2.so
+          ls -lh app/src/main/jniLibs/arm64-v8a/libaapt2.so
+
+      - name: Birim Testleri ve Debug APK Derlemesi
+        run: |
+          chmod +x ./gradlew
+          ./gradlew testDebugUnitTest assembleDebug --stacktrace
+
+      - name: APK Çıktısını Yükle (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiniAndroidIDE-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error

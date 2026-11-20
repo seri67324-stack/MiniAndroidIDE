@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ide_primary">#3B82F6</color>
+    <color name="ide_primary_dark">#1D4ED8</color>
+    <color name="ide_primary_container">#DBEAFE</color>
+    <color name="ide_on_primary_container">#1E3A8A</color>
+
+    <color name="ide_secondary">#6366F1</color>
+    <color name="ide_success">#10B981</color>
+    <color name="ide_success_bg">#D1FAE5</color>
+    <color name="ide_warning">#F59E0B</color>
+    <color name="ide_warning_bg">#FEF3C7</color>
+    <color name="ide_error">#EF4444</color>
+    <color name="ide_error_bg">#FEE2E2</color>
+
+    <color name="ide_terminal_bg">#0F172A</color>
+    <color name="ide_terminal_header">#1E293B</color>
+    <color name="ide_terminal_text">#E2E8F0</color>
+    <color name="ide_terminal_accent">#38BDF8</color>
+
+    <color name="ide_surface_card_stroke">#33888888</color>
+    <color name="ic_launcher_background">#0F172A</color>
+</resources>
