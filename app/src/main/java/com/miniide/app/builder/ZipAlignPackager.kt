@@ -3,6 +3,7 @@ package com.miniide.app.builder
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.util.zip.CRC32
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
@@ -10,9 +11,19 @@ import java.util.zip.ZipOutputStream
 
 object ZipAlignPackager {
 
+    private const val BUFFER_SIZE = 8 * 1024
+
+    /**
+     * Tüm girdilere verilen sabit zaman damgası: 1981-01-01 00:00 UTC.
+     * DOS zaman aralığı (1980+) içinde olmalıdır. Aksi halde (ör. 0) bazı ZipOutputStream gerçekleştirimleri
+     * (masaüstü JDK) her girdiye 9 baytlık "genişletilmiş zaman damgası" alanı ekler ve 4-byte hizalamayı bozar.
+     */
+    private const val ENTRY_TIME_MILLIS = 347_155_200_000L
+
     /**
      * resources.ap_ ve classes.dex dosyalarını tek bir APK'da birleştirir.
      * Sıkıştırılmamış (STORED) girdileri 4-byte sınırına hizalar (zipalign -p 4 muadili).
+     * Girdiler belleğe topluca okunmaz; 8 KB'lık parçalarla akıtılır (büyük assets/ dosyalarında OOM olmaz).
      */
     fun packageAndAlign(resourcesApFile: File, dexFiles: List<File>, outputUnsignedApk: File) {
         if (outputUnsignedApk.exists()) outputUnsignedApk.delete()
@@ -27,16 +38,20 @@ object ZipAlignPackager {
                     while (entries.hasMoreElements()) {
                         val entry = entries.nextElement()
                         if (entry.isDirectory || !seenEntries.add(entry.name)) continue
-                        val bytes = resZip.getInputStream(entry).use { it.readBytes() }
 
-                        val storeUncompressed = entry.name == "resources.arsc" ||
-                                entry.name.endsWith(".png", ignoreCase = true) ||
-                                entry.name.endsWith(".webp", ignoreCase = true) ||
-                                entry.name.endsWith(".ogg", ignoreCase = true) ||
-                                entry.name.endsWith(".mp3", ignoreCase = true) ||
-                                entry.method == ZipEntry.STORED
-
-                        writeEntryAligned(zos, countingOut, entry.name, bytes, storeUncompressed)
+                        if (shouldStore(entry)) {
+                            // Boyut ve CRC32 zip'in merkezi dizininde zaten kayıtlıdır; yoksa akıştan hesapla.
+                            var size = entry.size
+                            var crc = entry.crc
+                            if (size < 0 || crc < 0) {
+                                val (c, s) = checksum { resZip.getInputStream(entry) }
+                                crc = c
+                                size = s
+                            }
+                            writeEntry(zos, countingOut, entry.name, true, size, crc) { resZip.getInputStream(entry) }
+                        } else {
+                            writeEntry(zos, countingOut, entry.name, false, -1L, 0L) { resZip.getInputStream(entry) }
+                        }
                     }
                 }
 
@@ -44,31 +59,55 @@ object ZipAlignPackager {
                 dexFiles.forEachIndexed { index, dexFile ->
                     val dexEntryName = if (index == 0) "classes.dex" else "classes${index + 1}.dex"
                     if (seenEntries.add(dexEntryName)) {
-                        val bytes = FileInputStream(dexFile).use { it.readBytes() }
-                        writeEntryAligned(zos, countingOut, dexEntryName, bytes, storeUncompressed = true)
+                        val (crc, size) = checksum { FileInputStream(dexFile) }
+                        writeEntry(zos, countingOut, dexEntryName, true, size, crc) { FileInputStream(dexFile) }
                     }
                 }
             }
         }
     }
 
-    private fun writeEntryAligned(
+    private fun shouldStore(entry: ZipEntry): Boolean =
+        entry.name == "resources.arsc" ||
+            entry.name.endsWith(".png", ignoreCase = true) ||
+            entry.name.endsWith(".webp", ignoreCase = true) ||
+            entry.name.endsWith(".ogg", ignoreCase = true) ||
+            entry.name.endsWith(".mp3", ignoreCase = true) ||
+            entry.method == ZipEntry.STORED
+
+    /** Akıştan (CRC32, bayt sayısı) çifti hesaplar; belleğe yalnızca 8 KB tampon alınır. */
+    private fun checksum(open: () -> InputStream): Pair<Long, Long> {
+        val crc = CRC32()
+        var total = 0L
+        val buffer = ByteArray(BUFFER_SIZE)
+        open().use { input ->
+            while (true) {
+                val n = input.read(buffer)
+                if (n < 0) break
+                crc.update(buffer, 0, n)
+                total += n
+            }
+        }
+        return crc.value to total
+    }
+
+    private fun writeEntry(
         zos: ZipOutputStream,
         countingOut: CountingOutputStream,
         name: String,
-        data: ByteArray,
-        storeUncompressed: Boolean
+        storeUncompressed: Boolean,
+        size: Long,
+        crc: Long,
+        open: () -> InputStream
     ) {
         val newEntry = ZipEntry(name)
-        newEntry.time = 0L
+        newEntry.time = ENTRY_TIME_MILLIS
 
         if (storeUncompressed) {
             newEntry.method = ZipEntry.STORED
-            newEntry.size = data.size.toLong()
-            newEntry.compressedSize = data.size.toLong()
-            val crc = CRC32()
-            crc.update(data)
-            newEntry.crc = crc.value
+            newEntry.size = size
+            newEntry.compressedSize = size
+            newEntry.crc = crc
 
             // ZIP Local File Header = 30 byte + dosya adı uzunluğu + extra alan uzunluğu
             val nameBytesLen = name.toByteArray(Charsets.UTF_8).size
@@ -91,7 +130,14 @@ object ZipAlignPackager {
         }
 
         zos.putNextEntry(newEntry)
-        zos.write(data)
+        val buffer = ByteArray(BUFFER_SIZE)
+        open().use { input ->
+            while (true) {
+                val n = input.read(buffer)
+                if (n < 0) break
+                zos.write(buffer, 0, n)
+            }
+        }
         zos.closeEntry()
     }
 

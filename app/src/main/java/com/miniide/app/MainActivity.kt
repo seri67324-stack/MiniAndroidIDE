@@ -114,6 +114,11 @@ class MainActivity : AppCompatActivity() {
         btnBuild.setOnClickListener { startBuild() }
         btnCancel.setOnClickListener {
             if (BuildEvents.running) {
+                val step = BuildEvents.currentStep
+                if (step.startsWith("ECJ") || step.startsWith("D8")) {
+                    // ECJ/D8 kütüphane çağrılarıdır; ortada kesilemez, adım bitince durur.
+                    Toast.makeText(this, "İptal istendi; $step adımı bitince derleme durdurulacak.", Toast.LENGTH_LONG).show()
+                }
                 startService(Intent(this, CompileService::class.java).setAction(CompileService.ACTION_CANCEL))
             }
         }

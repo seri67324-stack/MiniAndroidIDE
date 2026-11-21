@@ -4,6 +4,7 @@ import android.content.Context
 import com.android.tools.r8.D8
 import com.android.tools.r8.D8Command
 import com.android.tools.r8.OutputMode
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.job
@@ -21,13 +22,19 @@ class LegacyProjectBuilder(
     private val context: Context,
     private val projectDir: File,
     private val androidJarFile: File,
-    private val logger: BuildLogger
+    private val logger: BuildLogger,
+    /** true ise ECJ uyarıları (-nowarn kapalı) listelenir. */
+    private val showEcjWarnings: Boolean = false
 ) {
 
     @Volatile
     private var activeProcess: Process? = null
 
+    @Volatile
+    private var cancelled = false
+
     fun cancelActiveProcess() {
+        cancelled = true
         try {
             activeProcess?.destroyForcibly()
         } catch (_: Exception) {}
@@ -35,6 +42,7 @@ class LegacyProjectBuilder(
 
     fun build(scope: CoroutineScope): File {
         val disposable = scope.coroutineContext.job.invokeOnCompletion { cancelActiveProcess() }
+        val binDir = File(projectDir, "bin")
         try {
             val manifestFile = File(projectDir, "AndroidManifest.xml")
             val resDir = File(projectDir, "res")
@@ -42,7 +50,6 @@ class LegacyProjectBuilder(
             val srcDir = File(projectDir, "src")
             val libsDir = File(projectDir, "libs")
             val genDir = File(projectDir, "gen")
-            val binDir = File(projectDir, "bin")
 
             require(manifestFile.exists()) { "AndroidManifest.xml bulunamadı: ${manifestFile.absolutePath}" }
             require(srcDir.exists()) { "src/ klasörü bulunamadı: ${srcDir.absolutePath}" }
@@ -51,11 +58,18 @@ class LegacyProjectBuilder(
             val manifestText = manifestFile.readText()
             val minSdk = Regex("""android:minSdkVersion\s*=\s*"(\d+)"""")
                 .find(manifestText)?.groupValues?.get(1)?.toIntOrNull() ?: 21
+            val targetSdk = Regex("""android:targetSdkVersion\s*=\s*"(\d+)"""")
+                .find(manifestText)?.groupValues?.get(1)?.toIntOrNull() ?: 34
+            val appPackage = Regex("""package\s*=\s*"([^"]+)"""").find(manifestText)?.groupValues?.get(1)
 
             // 1. ADIM: Klasör Hazırlığı
             scope.ensureActive()
             logger.onProgress("Hazırlık", 8)
             logger.info("Hazırlık", "Proje dizini temizleniyor: ${projectDir.name} (minSdk=$minSdk)")
+
+            if (!manifestText.contains("<uses-sdk")) {
+                logger.info("Hazırlık", "Manifestte <uses-sdk> yok; minSdk=$minSdk, targetSdk=$targetSdk varsayıldı.")
+            }
 
             genDir.deleteRecursively()
             binDir.deleteRecursively()
@@ -67,16 +81,26 @@ class LegacyProjectBuilder(
             val resCompiledZip = File(binDir, "res_compiled.zip")
             val resourcesAp = File(binDir, "resources.ap_")
 
+            // libs/*.aar -> classes.jar + res/ (manifest birleştirme yok)
+            val aars = libsDir.listFiles { f -> f.isFile && f.extension.equals("aar", ignoreCase = true) }
+                ?.sortedBy { it.name }?.toList() ?: emptyList()
+            val aarContents = AarSupport.extract(aars, File(binDir, "aar"), appPackage)
+            if (aars.isNotEmpty()) {
+                logger.info("AAR", "${aars.size} AAR kütüphanesi açıldı (${aarContents.jars.size} jar, ${aarContents.resDirs.size} res).")
+                aarContents.warnings.forEach { logger.info("AAR", "⚠ $it") }
+            }
+
             // 2. ADIM: AAPT2 (compile & link)
             scope.ensureActive()
             logger.onProgress("AAPT2", 25)
-            runAapt2(resDir, assetsDir, manifestFile, genDir, resCompiledZip, resourcesAp)
+            runAapt2(resDir, assetsDir, manifestFile, genDir, binDir, resCompiledZip, resourcesAp, minSdk, targetSdk, aarContents)
 
             // 3. ADIM: ECJ (java -> class)
             scope.ensureActive()
             logger.onProgress("ECJ", 50)
-            val jarLibs = libsDir.listFiles { f -> f.isFile && f.extension.equals("jar", ignoreCase = true) }
-                ?.toList() ?: emptyList()
+            logger.info("ECJ", "Not: ECJ/D8 çalışırken iptal edilirse, mevcut adım bitince durdurulur.")
+            val jarLibs = (libsDir.listFiles { f -> f.isFile && f.extension.equals("jar", ignoreCase = true) }
+                ?.toList() ?: emptyList()) + aarContents.jars
             runEcj(srcDir, genDir, classesDir, jarLibs)
 
             // 4. ADIM: D8 (class -> dex)
@@ -100,8 +124,24 @@ class LegacyProjectBuilder(
 
             logger.onProgress("Bitti", 100)
             return signedApk
+        } catch (e: CancellationException) {
+            cleanupAfterCancel(binDir)
+            throw e
         } finally {
             disposable.dispose()
+        }
+    }
+
+    /** İptal edilen derlemeden kalan yarım ara dosyaları siler. */
+    private fun cleanupAfterCancel(binDir: File) {
+        try {
+            listOf("unsigned.apk", "res_compiled.zip", "resources.ap_").forEach { File(binDir, it).delete() }
+            File(binDir, "dex").deleteRecursively()
+            File(binDir, "aar").deleteRecursively()
+            binDir.listFiles { f -> f.name.startsWith("aar_res_") }?.forEach { it.delete() }
+            logger.info("Temizlik", "İptal sonrası yarım kalan ara dosyalar silindi.")
+        } catch (_: Exception) {
+            // Temizlik başarısız olursa bir sonraki derleme bin/ klasörünü zaten baştan oluşturur.
         }
     }
 
@@ -127,6 +167,7 @@ class LegacyProjectBuilder(
             activeProcess = null
         }
         val code = proc.waitFor()
+        if (cancelled) throw CancellationException("Derleme iptal edildi")
         if (output.isNotBlank()) {
             if (code == 0) logger.info(step, output.trim()) else logger.error(step, output.trim())
         }
@@ -142,8 +183,12 @@ class LegacyProjectBuilder(
         assetsDir: File,
         manifest: File,
         genDir: File,
+        binDir: File,
         resCompiledZip: File,
-        resourcesAp: File
+        resourcesAp: File,
+        minSdk: Int,
+        targetSdk: Int,
+        aar: AarContents
     ) {
         val aapt2 = aapt2Binary().absolutePath
 
@@ -153,7 +198,11 @@ class LegacyProjectBuilder(
             "--manifest", manifest.absolutePath,
             "--java", genDir.absolutePath,
             "-o", resourcesAp.absolutePath,
-            "--auto-add-overlay"
+            "--auto-add-overlay",
+            // Manifestte <uses-sdk> yoksa kullanılacak varsayılanlar (aksi halde targetSdk=1 olur ve
+            // Android 14+ APK'yı kurmayı reddeder).
+            "--min-sdk-version", minSdk.toString(),
+            "--target-sdk-version", targetSdk.toString()
         )
 
         if (assetsDir.exists() && assetsDir.isDirectory) {
@@ -162,14 +211,28 @@ class LegacyProjectBuilder(
             logger.info("AAPT2", "assets/ klasörü pakete dahil ediliyor.")
         }
 
+        if (aar.rPackages.isNotEmpty()) {
+            link.add("--extra-packages")
+            link.add(aar.rPackages.joinToString(":"))
+        }
+
+        // Girdi sırası: önce AAR kaynakları, en sonda uygulamanın kendi kaynakları (üzerine yazar).
+        val compiledInputs = ArrayList<File>()
+        aar.resDirs.forEachIndexed { index, dir ->
+            val zip = File(binDir, "aar_res_$index.zip")
+            runProcess("AAPT2", listOf(aapt2, "compile", "--dir", dir.absolutePath, "-o", zip.absolutePath))
+            compiledInputs.add(zip)
+        }
+
         val hasResFiles = resDir.exists() && resDir.isDirectory &&
                 resDir.walkTopDown().any { it.isFile }
         if (hasResFiles) {
             runProcess("AAPT2", listOf(aapt2, "compile", "--dir", resDir.absolutePath, "-o", resCompiledZip.absolutePath))
-            link.add(resCompiledZip.absolutePath)
-        } else {
+            compiledInputs.add(resCompiledZip)
+        } else if (compiledInputs.isEmpty()) {
             logger.info("AAPT2", "res/ klasörü boş veya yok, yalnızca manifest bağlanıyor.")
         }
+        compiledInputs.forEach { link.add(it.absolutePath) }
 
         runProcess("AAPT2", link)
         logger.info("AAPT2", "R.java ve resources.ap_ başarıyla üretildi.")
@@ -186,10 +249,10 @@ class LegacyProjectBuilder(
             "-source", "1.8",
             "-target", "1.8",
             "-proc:none",
-            "-nowarn",
             "-encoding", "UTF-8",
             "-bootclasspath", androidJarFile.absolutePath
         )
+        if (!showEcjWarnings) argsList.add("-nowarn")
 
         if (jarLibs.isNotEmpty()) {
             val cp = jarLibs.joinToString(File.pathSeparator) { it.absolutePath }

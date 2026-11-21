@@ -61,11 +61,18 @@ val ensureAndroidJar by tasks.registering {
         val assetJar = file("src/main/assets/android.jar")
         if (!assetJar.exists()) {
             val sdkJar = file("${android.sdkDirectory}/platforms/android-${android.compileSdk}/android.jar")
-            if (sdkJar.exists()) {
-                assetJar.parentFile.mkdirs()
-                sdkJar.copyTo(assetJar, overwrite = true)
-                println("Copied android.jar from SDK: ${sdkJar.absolutePath}")
+            if (!sdkJar.exists()) {
+                // Sessizce geçmek yerine derlemeyi durdur: aksi halde APK derlenir ama uygulama ilk
+                // derlemede android.jar bulamayıp çöker.
+                throw GradleException(
+                    "android.jar bulunamadı. Şunlardan birini yapın:\n" +
+                    "  1) Android SDK'dan 'platforms;android-${android.compileSdk}' paketini kurun (beklenen: ${sdkJar.absolutePath})\n" +
+                    "  2) android.jar dosyasını elle app/src/main/assets/android.jar konumuna kopyalayın."
+                )
             }
+            assetJar.parentFile.mkdirs()
+            sdkJar.copyTo(assetJar, overwrite = true)
+            println("Copied android.jar from SDK: ${sdkJar.absolutePath}")
         }
     }
 }
