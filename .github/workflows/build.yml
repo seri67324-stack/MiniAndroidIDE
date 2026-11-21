@@ -51,7 +51,21 @@ jobs:
       - name: Birim Testleri ve Debug APK Derlemesi
         run: |
           chmod +x ./gradlew
-          ./gradlew testDebugUnitTest assembleDebug --stacktrace
+          set -o pipefail
+          ./gradlew testDebugUnitTest assembleDebug --console=plain 2>&1 | tee build.log
+
+      - name: Hata Özeti
+        if: failure()
+        run: |
+          echo "=============== HATA OZETI ==============="
+          echo "--- Gradle: What went wrong ---"
+          grep -n -A10 "What went wrong" build.log | head -40 || true
+          echo "--- Kotlin/Java derleme hatalari (e: ...) ---"
+          grep -n -E "^e: |error: " build.log | head -30 || true
+          echo "--- Basarisiz gorev/test ---"
+          grep -n -E "FAILED" build.log | head -20 || true
+          echo "--- Test raporlarindaki hatalar ---"
+          grep -h -E "<failure message|AssertionError|<error message" app/build/test-results/testDebugUnitTest/*.xml 2>/dev/null | cut -c1-300 | head -15 || true
 
       - name: APK Çıktısını Yükle (Artifact)
         uses: actions/upload-artifact@v4
